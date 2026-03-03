@@ -49,3 +49,19 @@ python3 module4_ui/app.py
 
 Then open http://0.0.0.0:7000
 
+
+---------------------------------------------------------
+
+INSTALLATION
+
+# One-command install (Debian/Ubuntu):
+curl -fsSL https://raw.githubusercontent.com/AROMAL642/wifi_dcs/main/install.sh | bash
+
+# Or after clone:
+./install.sh
+
+# Manual steps (if you prefer):
+git clone https://github.com/AROMAL642/wifi_dcs.git
+cd wifi_dcs
+pip install -r module1_discovery/requirements.txt
+pip install -r module4_ui/requirements.txt
