@@ -24,9 +24,11 @@ python3 module3_execution/worker.py --name WorkerA --port 6000
 
 (Use different --name; port can stay 6000 on each host.)
 
-
-
-
+# IMPORTANT for auto-discovery:
+# 1) Master and workers must be on the same subnet/VLAN.
+# 2) Worker port (default 6000) must be reachable from master.
+# 3) OS firewall must allow incoming TCP/UDP on worker/discovery ports.
+# 4) Some Wi‑Fi/AP setups block client-to-client traffic (AP isolation).
 
 On the master machine:
 
@@ -35,11 +37,17 @@ Auto-discover workers on Wi‑Fi:
 cd /home/aromal/Desktop/MAIN_PROJECT_FINAL
 python3 module3_execution/master.py --task range_sum --start 1 --end 20000 --chunk-size 5000
 
+# If auto-discovery shows "No workers found" but manual --nodes works:
+# - Keep using --nodes (most reliable), OR
+# - verify discovery prerequisites above, then retry.
 
 Or specify workers explicitly (recommended if discovery is blocked):
 
 python3 module3_execution/master.py --task range_sum --start 1 --end 20000 --chunk-size 5000 --nodes 192.168.1.10:6000,192.168.1.11:6000
+python3 module3_execution/master.py --task range_sum --start 1 --end 20000 --chunk-size 5000 --nodes 10.124.246.145:6000
 
+# Quick connectivity test from master:
+# nc -zv <worker_ip> 6000
 
 =====================================================================
 Run the UI:

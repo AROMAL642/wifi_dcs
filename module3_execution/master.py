@@ -41,28 +41,74 @@ DEFAULT_WORKER_PORT = 6000
 
 
 class MasterOrchestrator:
-    def __init__(self, discover_timeout: int = 6):
+    def __init__(self, discover_timeout: int = 15, probe_timeout: int = 2):
         self.discover_timeout = discover_timeout
+        self.probe_timeout = probe_timeout
 
     def discover_workers(self) -> List[Dict]:
-        """Run a short discovery scan and return workers that expose worker_port."""
+        """
+        Run discovery scan and actively probe discovered IPs for worker ports.
+        Returns list of worker nodes that are actually listening.
+        """
+        print("🔍 Discovering workers...\n")
         service = DiscoveryService(scan_interval=15)
         service.start()
         time.sleep(self.discover_timeout)
         service.stop()
         nodes = service.get_discovered_nodes()
 
+        if not nodes:
+            print("⚠️  No live devices found on network. Starting workers manually:")
+            print("   python3 module3_execution/worker.py --name WorkerA --port 6000\n")
+            return []
+
+        print(f"📡 Found {len(nodes)} live devices. Probing for worker services...\n")
+
         workers = []
         for ip, data in nodes.items():
+            device_name = data.get("device_name") or data.get("hostname") or ip
+            
+            # Check if node has worker_port field (it's running our worker service)
             port = data.get("worker_port")
+            
             if port:
+                # Already has worker_port from discovery response
                 workers.append({
                     "ip": ip,
                     "port": int(port),
-                    "name": data.get("device_name") or data.get("hostname") or ip,
+                    "name": device_name,
                     "capabilities": data.get("capabilities", [])
                 })
+                print(f"✓ {device_name} ({ip}:{port}) - Worker service detected")
+            else:
+                # No worker_port in discovery response, but probe the default port anyway
+                print(f"  Probing {device_name} ({ip}:{DEFAULT_WORKER_PORT})...", end=" ", flush=True)
+                if self._probe_worker_port(ip, DEFAULT_WORKER_PORT):
+                    workers.append({
+                        "ip": ip,
+                        "port": DEFAULT_WORKER_PORT,
+                        "name": device_name,
+                        "capabilities": []
+                    })
+                    print("✓ Worker service found")
+                else:
+                    print("✗ No worker service (not suitable for task execution)")
+
         return workers
+
+    def _probe_worker_port(self, ip: str, port: int = DEFAULT_WORKER_PORT) -> bool:
+        """
+        Try to connect to worker port on the given IP.
+        Returns True if a worker is listening.
+        """
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.probe_timeout)
+            result = sock.connect_ex((ip, port))
+            sock.close()
+            return result == 0
+        except Exception:
+            return False
 
     def run_range_sum(self, start: int, end: int, chunk_size: int, workers: List[Dict]):
         # Dynamically adjust chunk_size so there are at least as many tasks as workers
@@ -209,21 +255,30 @@ def main():
     parser.add_argument("--chunk-size", type=int, default=50_000, help="Chunk size for splitting tasks")
     parser.add_argument("--numbers", type=str, default=None, help="Comma-separated numbers for array_sum (e.g., 1,2,3,4)")
     parser.add_argument("--nodes", type=str, default=None, help="Comma-separated worker list (ip or ip:port). If omitted, auto-discover.")
-    parser.add_argument("--discover-timeout", type=int, default=6, help="Seconds to wait for discovery")
+    parser.add_argument("--discover-timeout", type=int, default=15, help="Seconds to wait for discovery (default: 15)")
     args = parser.parse_args()
 
     master = MasterOrchestrator(discover_timeout=args.discover_timeout)
 
     if args.nodes:
         workers = parse_nodes(args.nodes)
-        print(f"Using manual worker list: {workers}")
+        print(f"✓ Using manual worker list:")
+        for w in workers:
+            print(f"  - {w['name']} ({w['ip']}:{w['port']})")
+        print()
     else:
-        print("🔍 Discovering workers...")
         workers = master.discover_workers()
         if not workers:
-            print("❌ No workers found. Start worker.py on remote nodes or specify --nodes")
+            print("\n❌ No workers found. Please:")
+            print("   1. Start workers on real machines or same network:")
+            print("      python3 module3_execution/worker.py --name WorkerA --port 6000")
+            print("   2. Or specify workers manually (IP must have port 6000 listening):")
+            print("      python3 master.py --task range_sum --end 20000 --nodes 10.69.221.145:6000")
             return
-        print(f"✅ Found {len(workers)} workers: {[w['ip'] for w in workers]}")
+        print(f"\n✅ Found {len(workers)} active workers:\n")
+        for w in workers:
+            print(f"  ✓ {w['name']} ({w['ip']}:{w['port']})")
+        print()
 
     if args.task == "range_sum":
         master.run_range_sum(args.start, args.end, args.chunk_size, workers)
