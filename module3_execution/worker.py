@@ -54,6 +54,7 @@ class WorkerServer:
         print(f"  Discovery port : {DISCOVERY_PORT}")
         print(f"  Worker port    : {self.worker_port}")
         print(f"  IP             : {self.node_info.ip_address}")
+        print(f"  Listening for tasks...\n")
 
     def stop(self):
         self.running = False
@@ -95,7 +96,7 @@ class WorkerServer:
             server.bind(('', self.worker_port))
             server.listen(5)
             server.settimeout(1.0)
-            print(f"Listening for tasks on TCP port {self.worker_port}...")
+            
             while self.running:
                 try:
                     conn, addr = server.accept()
@@ -135,16 +136,43 @@ class WorkerServer:
                 self._send(conn, {"type": "error", "task_id": task_id, "message": "unsupported task"})
                 return
 
+            # Print task received on worker terminal
+            self._print_task_status(task_id, "received", task_name, payload)
+            
             self._send(conn, {"type": "ack", "task_id": task_id, "status": "accepted", "worker": self.node_name})
 
             start_time = time.time()
+            last_progress = 0
 
             def progress_cb(p: float):
-                self._send(conn, {"type": "progress", "task_id": task_id, "progress": round(p * 100, 2), "status": "running"})
+                """Callback for task progress - sends to master and logs locally"""
+                nonlocal last_progress
+                progress_percent = round(p * 100, 2)
+                
+                # Only send/print if progress changed significantly
+                if progress_percent >= last_progress + 10 or progress_percent >= 100:
+                    # Send to master
+                    self._send(conn, {
+                        "type": "progress",
+                        "task_id": task_id,
+                        "progress": progress_percent,
+                        "status": "running"
+                    })
+                    
+                    # Print on worker terminal
+                    self._print_task_progress(task_id, progress_percent)
+                    last_progress = progress_percent
 
             try:
+                # Execute task with progress callback
+                self._print_task_status(task_id, "executing", task_name, payload)
                 result = execute_task(task_name, payload, progress_cb)
                 duration = (time.time() - start_time) * 1000
+                
+                # Print completion on worker terminal
+                self._print_task_status(task_id, "completed", task_name, None, duration_ms=duration)
+                
+                # Send result to master
                 self._send(conn, {
                     "type": "result",
                     "task_id": task_id,
@@ -154,6 +182,10 @@ class WorkerServer:
                     "duration_ms": round(duration, 2)
                 })
             except Exception as e:
+                # Print error on worker terminal
+                self._print_task_status(task_id, "failed", task_name, None, error=str(e))
+                
+                # Send error to master
                 self._send(conn, {
                     "type": "result",
                     "task_id": task_id,
@@ -168,13 +200,52 @@ class WorkerServer:
                 pass
 
     def _send(self, conn: socket.socket, obj: Dict):
+        """Send JSON object to master"""
         try:
             data = json.dumps(obj) + "\n"
             conn.sendall(data.encode('utf-8'))
         except Exception:
             pass
 
+    def _print_task_status(self, task_id: str, status: str, task_name: str = None, payload: Dict = None, duration_ms: float = None, error: str = None):
+        """Print task status on worker terminal"""
+        timestamp = time.strftime("%H:%M:%S")
+        
+        if status == "received":
+            print(f"[{timestamp}] 📥 Task received: {task_id}")
+            print(f"           Task: {task_name}")
+            if payload:
+                if task_name == "range_sum":
+                    start = payload.get("start")
+                    end = payload.get("end")
+                    print(f"           Range: {start} to {end}")
+                elif task_name == "array_sum":
+                    count = len(payload.get("numbers", []))
+                    print(f"           Count: {count} numbers")
+        
+        elif status == "executing":
+            print(f"[{timestamp}] ⚙️  Executing: {task_id}")
+        
+        elif status == "completed":
+            print(f"[{timestamp}] ✅ Completed: {task_id}")
+            if duration_ms is not None:
+                print(f"           Duration: {duration_ms:.2f} ms")
+        
+        elif status == "failed":
+            print(f"[{timestamp}] ❌ Failed: {task_id}")
+            if error:
+                print(f"           Error: {error}")
+
+    def _print_task_progress(self, task_id: str, progress_percent: float):
+        """Print task progress on worker terminal"""
+        timestamp = time.strftime("%H:%M:%S")
+        bar_length = 20
+        filled = int(bar_length * progress_percent / 100)
+        bar = "█" * filled + "░" * (bar_length - filled)
+        print(f"[{timestamp}] 🔄 {task_id}: [{bar}] {progress_percent:.0f}%")
+
     def _build_node_info(self) -> Dict:
+        """Build node info dict for discovery response"""
         info = self.collector.to_dict(self.node_info)
         info.update({
             "worker_port": self.worker_port,
