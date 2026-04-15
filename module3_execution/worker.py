@@ -24,13 +24,16 @@ try:
 except Exception:
     from node_info import NodeInfoCollector  # fallback if run inside module1_discovery
 
-from module3_execution.tasks import execute_task, SUPPORTED_TASKS
+from module3_execution.tasks import execute_task, SUPPORTED_TASKS, register_custom_task
+from custom_task_registry import save_custom_task
 
 DISCOVERY_PORT = 5555
 DEFAULT_WORKER_PORT = 6000
 
 
 class WorkerServer:
+    """Worker/Slave node service with custom task reception."""
+    
     def __init__(self, worker_port: int = DEFAULT_WORKER_PORT, node_name: str = None):
         self.worker_port = worker_port
         self.node_name = node_name
@@ -41,6 +44,7 @@ class WorkerServer:
         self.node_info = self.collector.collect_all_info()
         if not self.node_name:
             self.node_name = self.node_info.hostname
+        self.custom_tasks_registered = {}  # Track registered custom tasks
 
     def start(self):
         self.running = True
@@ -112,7 +116,7 @@ class WorkerServer:
             print(f"TCP server error: {e}")
 
     def _handle_client(self, conn: socket.socket, addr):
-        """Handle a master connection and run a single task."""
+        """Handle a master connection (task execution or registration)."""
         file = conn.makefile('r')
         try:
             line = file.readline()
@@ -124,7 +128,15 @@ class WorkerServer:
                 self._send(conn, {"type": "error", "message": "invalid json"})
                 return
 
-            if msg.get("type") != "task":
+            msg_type = msg.get("type")
+            
+            # NEW: Handle custom task registration from master
+            if msg_type == "register_custom_task":
+                self._handle_custom_task_registration(conn, msg)
+                return
+            
+            # Existing: Handle task execution
+            if msg_type != "task":
                 self._send(conn, {"type": "error", "message": "invalid message type"})
                 return
 
@@ -198,7 +210,70 @@ class WorkerServer:
                 conn.close()
             except Exception:
                 pass
-
+    
+    def _handle_custom_task_registration(self, conn: socket.socket, msg: Dict):
+        """Handle custom task registration from master."""
+        try:
+            task_name = msg.get("task_name")
+            executor_code = msg.get("executor_code")
+            aggregator_code = msg.get("aggregator_code")
+            description = msg.get("description", "")
+            parameters = msg.get("parameters", [])
+            
+            if not all([task_name, executor_code, aggregator_code]):
+                self._send(conn, {"type": "error", "message": "Missing task data"})
+                return
+            
+            # Validate executor code
+            namespace = {}
+            exec(executor_code, namespace)
+            executor_func = namespace.get("executor")
+            
+            # Validate aggregator code
+            namespace = {}
+            exec(aggregator_code, namespace)
+            aggregator_func = namespace.get("aggregator")
+            
+            if not executor_func or not aggregator_func:
+                self._send(conn, {"type": "error", "message": "Invalid functions"})
+                return
+            
+            # Register in worker's memory
+            register_custom_task(
+                task_name=task_name,
+                executor=executor_func,
+                aggregator=aggregator_func,
+                description=description
+            )
+            
+            # Save to worker's registry file
+            save_custom_task(task_name, executor_code, aggregator_code, description, parameters)
+            
+            # Track registered task
+            self.custom_tasks_registered[task_name] = True
+            
+            # Send success response
+            self._send(conn, {
+                "type": "success",
+                "message": f"Task '{task_name}' registered successfully",
+                "task_name": task_name
+            })
+            
+            self._print_task_registration(task_name, description, parameters)
+        
+        except Exception as e:
+            self._send(conn, {
+                "type": "error",
+                "message": f"Failed to register task: {str(e)}"
+            })
+    
+    def _print_task_registration(self, task_name: str, description: str, parameters: list):
+        """Print task registration on worker terminal."""
+        timestamp = time.strftime("%H:%M:%S")
+        print(f"[{timestamp}] 📥 Custom Task Registered: {task_name}")
+        print(f"           Description: {description}")
+        print(f"           Parameters: {', '.join(parameters) if parameters else 'None'}")
+    
     def _send(self, conn: socket.socket, obj: Dict):
         """Send JSON object to master"""
         try:

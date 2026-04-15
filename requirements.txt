@@ -6,7 +6,6 @@ Includes task generation, execution, and aggregation helpers.
 from typing import Callable, Dict, List, Optional
 import time
 import os
-import sys
 from pathlib import Path
 
 from typing import Union
@@ -116,57 +115,13 @@ def execute_task(task_name: str, payload: TaskPayload, progress_cb: Callable[[fl
     if task_name == "array_sum":
         return _execute_array_sum(payload, progress_cb)
     
-    # Check custom registry in memory (for Master)
+    # Check custom registry
     custom_executor = _custom_registry.get_executor(task_name)
     if custom_executor:
         validator = _custom_registry.get_validator(task_name)
         if validator:
             validator(payload)
         return custom_executor(payload, progress_cb)
-    
-    # Try to load from shared registry (for Workers)
-    try:
-        import json
-        from pathlib import Path
-        
-        # Look for registry in multiple locations
-        possible_paths = [
-            Path(__file__).parent.parent / "custom_tasks_registry.json",  # Module location
-            Path.cwd() / "custom_tasks_registry.json",  # Current working directory
-            Path.home() / "custom_tasks_registry.json",  # Home directory
-        ]
-        
-        registry_data = None
-        for registry_path in possible_paths:
-            if registry_path.exists():
-                try:
-                    with open(registry_path, 'r') as f:
-                        registry_data = json.load(f)
-                    break
-                except Exception:
-                    continue
-        
-        # If we found the registry and the task exists
-        if registry_data and task_name in registry_data:
-            task_data = registry_data[task_name]
-            executor_code = task_data.get("executor_code", "")
-            
-            if executor_code.strip():
-                # Execute the custom code dynamically
-                namespace = {}
-                try:
-                    exec(executor_code, namespace)
-                    executor_func = namespace.get("executor")
-                    
-                    if executor_func:
-                        # Run the custom executor
-                        return executor_func(payload, progress_cb)
-                except Exception as e:
-                    raise ValueError(f"Error executing custom task '{task_name}': {str(e)}")
-    
-    except Exception as e:
-        # If anything goes wrong loading from registry, just continue to error
-        pass
     
     raise ValueError(f"Unsupported task: {task_name}")
 
@@ -287,35 +242,12 @@ def get_all_tasks() -> Dict:
 
 
 def get_task_info(task_name: str) -> Optional[Dict]:
-    """Get task information including executor code for custom tasks."""
-    # Check built-in tasks first
+    """Get information about a specific task."""
     if task_name in SUPPORTED_TASKS:
         return SUPPORTED_TASKS[task_name]
     
-    # Load custom task from registry
-    try:
-        from pathlib import Path
-        import json
-        
-        registry_file = Path(__file__).parent.parent / "custom_tasks_registry.json"
-        if registry_file.exists():
-            with open(registry_file, 'r') as f:
-                registry = json.load(f)
-                if task_name in registry:
-                    task_data = registry[task_name]
-                    return {
-                        "executor": _custom_registry.get_executor(task_name),
-                        "aggregator": _custom_registry.get_aggregator(task_name),
-                        "executor_code": task_data.get("executor_code", ""),
-                        "aggregator_code": task_data.get("aggregator_code", ""),
-                        "description": task_data.get("description", ""),
-                        "parameters": task_data.get("parameters", [])
-                    }
-    except Exception:
-        pass
-    
-    # Fallback to registry functions
-    return {
+    task_info = {
         "executor": _custom_registry.get_executor(task_name),
         "aggregator": _custom_registry.get_aggregator(task_name),
     }
+    return task_info if task_info["executor"] else None

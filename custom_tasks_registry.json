@@ -1,0 +1,51 @@
+{
+  "hashhhhh": {
+    "executor_code": "def executor(payload, progress_cb):\n    import hashlib\n    \n    target_hash = payload.get(\"target_hash\", \"\").lower()\n    hash_type = payload.get(\"hash_type\", \"md5\").lower()\n    start = payload.get(\"start\", 0)\n    end = payload.get(\"end\", 2500)\n    \n    if not target_hash:\n        return {\"status\": \"error\", \"message\": \"No target hash provided\"}\n    \n    found = False\n    result_value = None\n    total_checks = end - start\n    \n    try:\n        for idx, num in enumerate(range(start, end), start=1):\n            password = str(num).zfill(4)\n            \n            if hash_type == \"md5\":\n                computed_hash = hashlib.md5(password.encode()).hexdigest()\n            elif hash_type == \"sha256\":\n                computed_hash = hashlib.sha256(password.encode()).hexdigest()\n            elif hash_type == \"sha1\":\n                computed_hash = hashlib.sha1(password.encode()).hexdigest()\n            else:\n                return {\"status\": \"error\", \"message\": f\"Unsupported hash: {hash_type}\"}\n            \n            if idx % 250 == 0 or idx == total_checks:\n                progress_cb(idx / total_checks)\n            \n            if computed_hash == target_hash:\n                found = True\n                result_value = password\n                progress_cb(1.0)\n                break\n        \n        if found:\n            return {\n                \"status\": \"success\",\n                \"found\": True,\n                \"password\": result_value,\n                \"range\": f\"{start}-{end}\"\n            }\n        else:\n            return {\n                \"status\": \"success\",\n                \"found\": False,\n                \"range\": f\"{start}-{end}\"\n            }\n    \n    except Exception as e:\n        return {\"status\": \"error\", \"message\": str(e)}",
+    "aggregator_code": "def aggregator(results):\n    for result in results:\n        if result.get(\"status\") == \"success\" and result.get(\"found\"):\n            return {\n                \"task\": \"hash_crack\",\n                \"status\": \"success\",\n                \"found\": True,\n                \"password\": result.get(\"password\"),\n                \"message\": f\"\u2713 PASSWORD CRACKED: {result.get('password')}\",\n                \"found_in_range\": result.get(\"range\"),\n                \"total_ranges_checked\": len(results)\n            }\n    \n    return {\n        \"task\": \"hash_crack\",\n        \"status\": \"success\",\n        \"found\": False,\n        \"message\": \"\u2717 PASSWORD NOT FOUND (0000-9999)\",\n        \"total_ranges_checked\": len(results)\n    }",
+    "description": "haaa",
+    "parameters": [
+      "end",
+      "hash_type",
+      "start",
+      "target_hash"
+    ]
+  },
+  "hashpass": {
+    "executor_code": "def executor(payload, progress_cb):\n    import hashlib\n    \n    target_hash = payload.get(\"target_hash\", \"\").lower()\n    hash_type = payload.get(\"hash_type\", \"md5\").lower()\n    start = payload.get(\"start\", 0)\n    end = payload.get(\"end\", 2500)\n    \n    if not target_hash:\n        return {\"status\": \"error\", \"message\": \"No target hash provided\"}\n    \n    found = False\n    result_value = None\n    total_checks = end - start\n    \n    try:\n        for idx, num in enumerate(range(start, end), start=1):\n            password = str(num).zfill(4)\n            \n            if hash_type == \"md5\":\n                computed_hash = hashlib.md5(password.encode()).hexdigest()\n            elif hash_type == \"sha256\":\n                computed_hash = hashlib.sha256(password.encode()).hexdigest()\n            elif hash_type == \"sha1\":\n                computed_hash = hashlib.sha1(password.encode()).hexdigest()\n            else:\n                return {\"status\": \"error\", \"message\": f\"Unsupported hash: {hash_type}\"}\n            \n            if idx % 250 == 0 or idx == total_checks:\n                progress_cb(idx / total_checks)\n            \n            if computed_hash == target_hash:\n                found = True\n                result_value = password\n                progress_cb(1.0)\n                break\n        \n        if found:\n            return {\n                \"status\": \"success\",\n                \"found\": True,\n                \"password\": result_value,\n                \"range\": f\"{start}-{end}\"\n            }\n        else:\n            return {\n                \"status\": \"success\",\n                \"found\": False,\n                \"range\": f\"{start}-{end}\"\n            }\n    \n    except Exception as e:\n        return {\"status\": \"error\", \"message\": str(e)}",
+    "aggregator_code": "def aggregator(results):\n    for result in results:\n        if result.get(\"status\") == \"success\" and result.get(\"found\"):\n            return {\n                \"task\": \"hash_crack\",\n                \"status\": \"success\",\n                \"found\": True,\n                \"password\": result.get(\"password\"),\n                \"message\": f\"\u2713 PASSWORD CRACKED: {result.get('password')}\",\n                \"found_in_range\": result.get(\"range\"),\n                \"total_ranges_checked\": len(results)\n            }\n    \n    return {\n        \"task\": \"hash_crack\",\n        \"status\": \"success\",\n        \"found\": False,\n        \"message\": \"\u2717 PASSWORD NOT FOUND (0000-9999)\",\n        \"total_ranges_checked\": len(results)\n    }",
+    "description": "hashhhhhh",
+    "parameters": [
+      "end",
+      "hash_type",
+      "start",
+      "target_hash"
+    ]
+  },
+  "RANGE": {
+    "executor_code": "def executor(payload, progress_cb):\n    start = int(payload.get(\"start\", 1))\n    end = int(payload.get(\"end\", 100))\n\n    if start > end:\n        start, end = end, start\n\n    total = 0\n    count = end - start + 1\n    report_every = max(1, count // 10)\n\n    for idx, value in enumerate(range(start, end + 1), start=1):\n        total += value\n        if idx % report_every == 0 or idx == count:\n            progress_cb(idx / count)\n\n    return {\n        \"status\": \"success\",\n        \"partial_sum\": total,\n        \"count\": count,\n        \"start\": start,\n        \"end\": end\n    }",
+    "aggregator_code": "def aggregator(results):\n    return {\"task\": \"custom\", \"total\": len(results)}",
+    "description": "SUM",
+    "parameters": [
+      "end",
+      "start"
+    ]
+  },
+  "Prime check": {
+    "executor_code": "def executor(payload, progress_cb):\n    numbers = payload.get(\"data\", [])\n\n    def is_prime(n: int) -> bool:\n        if n < 2:\n            return False\n        if n in (2, 3):\n            return True\n        if n % 2 == 0:\n            return False\n        i = 3\n        limit = int(n ** 0.5) + 1\n        while i <= limit:\n            if n % i == 0:\n                return False\n            i += 2\n        return True\n\n    primes = []\n    total = len(numbers) if numbers else 1\n\n    for idx, value in enumerate(numbers, start=1):\n        try:\n            n = int(value)\n            if is_prime(n):\n                primes.append(n)\n        except Exception:\n            pass\n\n        if idx % max(1, total // 10) == 0 or idx == total:\n            progress_cb(idx / total)\n\n    return {\n        \"status\": \"success\",\n        \"input_count\": len(numbers),\n        \"prime_count\": len(primes),\n        \"primes\": primes\n    }",
+    "aggregator_code": "def aggregator(results):\n    all_primes = []\n    total_input = 0\n\n    for res in results:\n        all_primes.extend(res.get(\"primes\", []))\n        total_input += res.get(\"input_count\", 0)\n\n    # Remove duplicates and sort\n    all_primes = sorted(set(all_primes))\n\n    return {\n        \"task\": \"prime_list\",\n        \"total_input\": total_input,\n        \"prime_count\": len(all_primes),\n        \"primes\": all_primes\n    }",
+    "description": "find prie numbers from an array",
+    "parameters": [
+      "data"
+    ]
+  },
+  "price_prediction": {
+    "executor_code": "def executor(payload, progress_cb):\n    import csv\n\n    dataset_files = payload.get(\"dataset_files\", [])\n    epochs = int(payload.get(\"epochs\", 200))\n    lr = float(payload.get(\"lr\", 1e-6))\n\n    if not dataset_files:\n        return {\"status\": \"error\", \"message\": \"No dataset_files provided\"}\n\n    xs, ys = [], []\n    for file_path in dataset_files:\n        with open(file_path, \"r\") as f:\n            reader = csv.DictReader(f)\n            for row in reader:\n                xs.append(float(row[\"size\"]))\n                ys.append(float(row[\"price\"]))\n\n    if not xs:\n        return {\"status\": \"error\", \"message\": \"Dataset is empty\"}\n\n    w, b = 0.0, 0.0\n    n = len(xs)\n\n    for epoch in range(1, epochs + 1):\n        dw, db = 0.0, 0.0\n        for x, y in zip(xs, ys):\n            pred = w * x + b\n            err = pred - y\n            dw += (2 / n) * err * x\n            db += (2 / n) * err\n\n        w -= lr * dw\n        b -= lr * db\n\n        if epoch % max(1, epochs // 10) == 0:\n            progress_cb(epoch / epochs)\n\n    mse = sum((w * x + b - y) ** 2 for x, y in zip(xs, ys)) / n\n\n    return {\n        \"status\": \"success\",\n        \"samples\": n,\n        \"w\": w,\n        \"b\": b,\n        \"mse\": mse\n    }",
+    "aggregator_code": "def aggregator(results):\n    if not results:\n        return {\"status\": \"error\", \"message\": \"No results\"}\n\n    w_sum, b_sum, mse_sum, n = 0.0, 0.0, 0.0, 0\n    for r in results:\n        if r.get(\"status\") == \"success\":\n            w_sum += r.get(\"w\", 0.0)\n            b_sum += r.get(\"b\", 0.0)\n            mse_sum += r.get(\"mse\", 0.0)\n            n += 1\n\n    if n == 0:\n        return {\"status\": \"error\", \"message\": \"No successful results\"}\n\n    return {\n        \"task\": \"linear_regression\",\n        \"avg_w\": w_sum / n,\n        \"avg_b\": b_sum / n,\n        \"avg_mse\": mse_sum / n,\n        \"workers\": n\n    }",
+    "description": "sample ML task",
+    "parameters": {
+      "dataset_files": [
+        "/home/aromal/Desktop/house_prices.csv"
+      ]
+    }
+  }
+}
