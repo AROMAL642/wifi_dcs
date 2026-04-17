@@ -11,6 +11,7 @@ import sys
 import socket
 import inspect
 import time
+import math
 import builtins
 from pathlib import Path
 from datetime import datetime
@@ -33,6 +34,19 @@ from module4_ui.discovery_service import NodeDiscoveryService, AdvertiseService
 from network_communication import MasterClient
 from module1_discovery.discovery_service import DiscoveryService as Module1DiscoveryService
 from module1_discovery.node_info import NodeInfoCollector
+
+try:
+    from module2_distribution.distribution_service import DistributionService
+    from module2_distribution.task_manager import (
+        SchedulingPolicy,
+        LoadBalanceStrategy,
+        Task as DistributionTask,
+    )
+except Exception:
+    DistributionService = None
+    SchedulingPolicy = None
+    LoadBalanceStrategy = None
+    DistributionTask = None
 
 
 def extract_parameters_from_code(code: str) -> List[str]:
@@ -160,6 +174,350 @@ def summarize_result(result: Dict[str, Any]) -> str:
 DEFAULT_AGGREGATOR_CODE = """def aggregator(results):
     return {"task": "custom", "results": results}
 """
+
+
+# Best-effort node resource hints keyed by "ip:port" and by "ip".
+# Populated from Module1 discovery when available.
+NODE_RESOURCE_HINTS: Dict[str, Dict[str, Any]] = {}
+
+
+def _parse_node_address(node: str) -> Optional[Tuple[str, int]]:
+    try:
+        host, port = node.split(":")
+        return host.strip(), int(port)
+    except Exception:
+        return None
+
+
+def _is_node_live(node: str, timeout: float = 0.8) -> bool:
+    """Fast TCP liveness check for worker node address (ip:port)."""
+    parsed = _parse_node_address(node)
+    if not parsed:
+        return False
+
+    host, port = parsed
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        return result == 0
+    except Exception:
+        return False
+
+
+def _split_live_and_dead_nodes(nodes: List[str], timeout: float = 0.8) -> Tuple[List[str], List[str]]:
+    """Split input nodes into currently live and dead lists."""
+    live_nodes: List[str] = []
+    dead_nodes: List[str] = []
+
+    for node in nodes:
+        if _is_node_live(node, timeout=timeout):
+            live_nodes.append(node)
+        else:
+            dead_nodes.append(node)
+
+    return live_nodes, dead_nodes
+
+
+def _collect_node_metrics(nodes: List[str], timeout: float = 0.8) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
+    """Collect lightweight node metrics and map IP -> first matching node address."""
+    active_nodes: Dict[str, Dict[str, Any]] = {}
+    ip_to_node: Dict[str, str] = {}
+
+    for node in nodes:
+        parsed = _parse_node_address(node)
+        if not parsed:
+            continue
+        host, port = parsed
+
+        if host not in ip_to_node:
+            ip_to_node[host] = node
+
+        hints = NODE_RESOURCE_HINTS.get(node, {}) or NODE_RESOURCE_HINTS.get(host, {})
+
+        latency_ms = 999.0
+        try:
+            started = time.perf_counter()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((host, port))
+            sock.close()
+            latency_ms = (time.perf_counter() - started) * 1000 if result == 0 else 999.0
+        except Exception:
+            latency_ms = 999.0
+
+        active_nodes[host] = {
+            "latency_ms": latency_ms,
+            "cpu_cores": hints.get("cpu_cores"),
+            "cpu_freq_mhz": hints.get("cpu_freq_mhz"),
+            "cpu_percent": hints.get("cpu_percent", 0.0),
+            "ram_total_gb": hints.get("ram_total_gb"),
+            "ram_available_gb": hints.get("ram_available_gb", 0.0),
+            "worker_port": port,
+        }
+
+    return active_nodes, ip_to_node
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _compute_weighted_chunk_quotas(
+    tasks: List[Dict[str, Any]],
+    nodes: List[str],
+    active_nodes: Dict[str, Dict[str, Any]],
+    ip_to_node: Dict[str, str],
+    failure_counts: Optional[Dict[str, int]] = None,
+) -> Optional[Dict[str, int]]:
+    """Compute per-node integer chunk quotas from CPU + RAM weighted capacity.
+
+        Mathematical model:
+            cpu_capacity_i = cores_i * freq_mhz_i * (1 - cpu_usage_i)
+            mem_capacity_i = ram_available_gb_i
+            net_quality_i = 1 / (1 + latency_ms_i / 100)
+            cpu_norm_i = cpu_capacity_i / Σ cpu_capacity
+            mem_norm_i = mem_capacity_i / Σ mem_capacity
+            net_norm_i = net_quality_i / Σ net_quality
+            base_weight_i = 0.55 * cpu_norm_i + 0.30 * mem_norm_i + 0.15 * net_norm_i
+            reliability_penalty_i = exp(-0.7 * failure_count_i)
+            weight_i = base_weight_i * reliability_penalty_i
+      ideal_chunks_i = total_chunks * weight_i
+
+    Integer quotas are obtained with Hamilton apportionment (floor + largest remainder),
+    guaranteeing Σ quotas == total_chunks.
+    """
+    if not tasks or not nodes:
+        return None
+
+    total_chunks = len(tasks)
+    failure_counts = failure_counts or {}
+
+    # Build resource vectors only for nodes we can map back to an address.
+    resource_rows: List[Tuple[str, float, float, float]] = []
+    for ip, metrics in active_nodes.items():
+        node_addr = ip_to_node.get(ip)
+        if not node_addr:
+            continue
+
+        cores = max(1.0, _to_float(metrics.get("cpu_cores"), 1.0))
+        freq_mhz = max(1000.0, _to_float(metrics.get("cpu_freq_mhz"), 1000.0))
+        cpu_percent = min(100.0, max(0.0, _to_float(metrics.get("cpu_percent"), 40.0)))
+        ram_available = max(0.25, _to_float(metrics.get("ram_available_gb"), 1.0))
+        latency_ms = max(0.0, _to_float(metrics.get("latency_ms"), 999.0))
+
+        cpu_capacity = max(0.001, cores * freq_mhz * (1.0 - (cpu_percent / 100.0)))
+        mem_capacity = max(0.001, ram_available)
+        net_quality = max(0.001, 1.0 / (1.0 + (latency_ms / 100.0)))
+        resource_rows.append((node_addr, cpu_capacity, mem_capacity, net_quality))
+
+    if not resource_rows:
+        return None
+
+    total_cpu = sum(cpu for _, cpu, _, _ in resource_rows)
+    total_mem = sum(mem for _, _, mem, _ in resource_rows)
+    total_net = sum(net for _, _, _, net in resource_rows)
+    if total_cpu <= 0 or total_mem <= 0 or total_net <= 0:
+        return None
+
+    CPU_WEIGHT = 0.55
+    MEM_WEIGHT = 0.30
+    NET_WEIGHT = 0.15
+
+    weighted: Dict[str, float] = {}
+    for node_addr, cpu_capacity, mem_capacity, net_quality in resource_rows:
+        cpu_norm = cpu_capacity / total_cpu
+        mem_norm = mem_capacity / total_mem
+        net_norm = net_quality / total_net
+
+        base_weight = (CPU_WEIGHT * cpu_norm) + (MEM_WEIGHT * mem_norm) + (NET_WEIGHT * net_norm)
+        fail_count = max(0, int(failure_counts.get(node_addr, 0)))
+        reliability_penalty = math.exp(-0.7 * fail_count)
+        weighted[node_addr] = base_weight * reliability_penalty
+
+    total_weight = sum(weighted.values())
+    if total_weight <= 0:
+        return None
+
+    # Hamilton method: floor first, then allocate by largest fractional remainder.
+    quotas: Dict[str, int] = {}
+    remainders: List[Tuple[float, str]] = []
+    allocated = 0
+    for node_addr in nodes:
+        weight = weighted.get(node_addr, 0.0)
+        ideal = (weight / total_weight) * total_chunks
+        base = math.floor(ideal)
+        quotas[node_addr] = base
+        allocated += base
+        remainders.append((ideal - base, node_addr))
+
+    remaining = total_chunks - allocated
+    if remaining > 0:
+        remainders.sort(key=lambda x: x[0], reverse=True)
+        for _, node_addr in remainders[:remaining]:
+            quotas[node_addr] = quotas.get(node_addr, 0) + 1
+
+    # If rounding produced edge anomalies, normalize with deterministic repair.
+    quota_total = sum(quotas.values())
+    if quota_total < total_chunks:
+        for _, node_addr in sorted(remainders, key=lambda x: x[0], reverse=True):
+            quotas[node_addr] = quotas.get(node_addr, 0) + 1
+            quota_total += 1
+            if quota_total == total_chunks:
+                break
+    elif quota_total > total_chunks:
+        for _, node_addr in sorted(remainders, key=lambda x: x[0]):
+            while quotas.get(node_addr, 0) > 0 and quota_total > total_chunks:
+                quotas[node_addr] -= 1
+                quota_total -= 1
+
+    return quotas
+
+
+def _order_nodes_with_module2(nodes: List[str], log_callback: Optional[Callable] = None) -> List[str]:
+    """Order nodes using Module 2 distribution metrics (fallback to original order)."""
+    if not nodes or DistributionService is None:
+        return nodes
+
+    try:
+        service = DistributionService(
+            scheduling_policy=SchedulingPolicy.LEAST_LOADED,
+            balance_strategy=LoadBalanceStrategy.LATENCY_AWARE,
+        )
+        active_nodes, ip_to_node = _collect_node_metrics(nodes)
+        service.active_nodes = active_nodes
+
+        perfs = service.get_all_node_performance()
+        scored: List[Tuple[float, str]] = []
+        for perf in perfs:
+            if not perf:
+                continue
+            ip = perf.get("ip")
+            if ip and ip in ip_to_node:
+                load_score = perf.get("load_score", 0.0)
+                scored.append((load_score, ip_to_node[ip]))
+
+        if not scored:
+            return nodes
+
+        scored.sort(key=lambda x: x[0])
+        ordered = [node for _, node in scored]
+
+        # Preserve any nodes missing in scored output.
+        remaining = [n for n in nodes if n not in ordered]
+        ordered.extend(remaining)
+
+        if log_callback:
+            log_callback(f"🧠 Module2 node order: {', '.join(ordered)}")
+        return ordered
+    except Exception as e:
+        if log_callback:
+            log_callback(f"⚠ Module2 ordering failed, fallback to default order: {e}")
+        return nodes
+
+
+def _assign_tasks_with_module2(
+    tasks: List[Dict[str, Any]],
+    nodes: List[str],
+    log_callback: Optional[Callable] = None,
+    failure_counts: Optional[Dict[str, int]] = None,
+) -> List[Tuple[Dict[str, Any], str]]:
+    """Assign chunk tasks to nodes using Module 2 DistributionService."""
+    if not tasks or not nodes:
+        return []
+
+    if DistributionService is None or DistributionTask is None:
+        return [(task, nodes[idx % len(nodes)]) for idx, task in enumerate(tasks)]
+
+    try:
+        service = DistributionService(
+            scheduling_policy=SchedulingPolicy.LEAST_LOADED,
+            balance_strategy=LoadBalanceStrategy.LATENCY_AWARE,
+        )
+        active_nodes, ip_to_node = _collect_node_metrics(nodes)
+        service.active_nodes = active_nodes
+
+        quotas = _compute_weighted_chunk_quotas(
+            tasks,
+            nodes,
+            active_nodes,
+            ip_to_node,
+            failure_counts=failure_counts,
+        )
+        if quotas:
+            if log_callback:
+                quota_preview = ", ".join(f"{n}:{q}" for n, q in quotas.items() if q > 0)
+                log_callback(f"📐 Weighted chunk quotas (CPU/RAM): {quota_preview}")
+
+            ordered_nodes = sorted(nodes, key=lambda n: quotas.get(n, 0), reverse=True)
+            scheduled_by_quota: List[Tuple[Dict[str, Any], str]] = []
+            task_index = 0
+            for node in ordered_nodes:
+                quota = quotas.get(node, 0)
+                for _ in range(quota):
+                    if task_index >= len(tasks):
+                        break
+                    scheduled_by_quota.append((tasks[task_index], node))
+                    task_index += 1
+
+            if task_index < len(tasks):
+                for idx in range(task_index, len(tasks)):
+                    scheduled_by_quota.append((tasks[idx], nodes[idx % len(nodes)]))
+
+            if scheduled_by_quota:
+                return scheduled_by_quota
+
+        distribution_tasks: List[Any] = []
+        task_lookup: Dict[str, Dict[str, Any]] = {}
+
+        for idx, task in enumerate(tasks):
+            task_id = task.get("task_id", f"chunk-{idx + 1}")
+            priority = 5
+            payload = task.get("payload", {})
+            if isinstance(payload, dict):
+                try:
+                    priority = int(payload.get("priority", 5))
+                except Exception:
+                    priority = 5
+
+            distribution_tasks.append(
+                DistributionTask(task_id=task_id, task_type="compute", priority=priority)
+            )
+            task_lookup[task_id] = task
+
+        assignment = service.distribute_tasks(distribution_tasks)
+        scheduled: List[Tuple[Dict[str, Any], str]] = []
+        seen_ids = set()
+
+        for ip, assigned in assignment.items():
+            node_addr = ip_to_node.get(ip)
+            if not node_addr:
+                continue
+            for assigned_task in assigned:
+                source_task = task_lookup.get(assigned_task.task_id)
+                if source_task is not None:
+                    scheduled.append((source_task, node_addr))
+                    seen_ids.add(assigned_task.task_id)
+
+        # Fallback for any unassigned tasks.
+        if len(scheduled) < len(tasks):
+            remaining_tasks = [t for t in tasks if t.get("task_id") not in seen_ids]
+            for idx, task in enumerate(remaining_tasks):
+                scheduled.append((task, nodes[idx % len(nodes)]))
+
+        if log_callback and scheduled:
+            preview = [f"{t.get('task_id', 'unknown')}->{n}" for t, n in scheduled[:10]]
+            log_callback(f"🧠 Module2 assignment: {', '.join(preview)}")
+
+        return scheduled
+    except Exception as e:
+        if log_callback:
+            log_callback(f"⚠ Module2 assignment failed, fallback to round-robin: {e}")
+        return [(task, nodes[idx % len(nodes)]) for idx, task in enumerate(tasks)]
 
 
 def count_attachment_files(payload: Dict[str, Any]) -> int:
@@ -299,15 +657,22 @@ class TaskExecutionWorker(threading.Thread):
             results = []
             errors = []
             run_started = time.perf_counter()
+            execution_nodes = _order_nodes_with_module2(self.nodes, self.log_callback)
+            execution_nodes, dead_nodes = _split_live_and_dead_nodes(execution_nodes, timeout=0.8)
+            if dead_nodes:
+                self.log_callback(f"⚠ Skipping offline workers before run: {', '.join(dead_nodes)}")
+            if not execution_nodes:
+                self.completion_callback(False, {"errors": ["No live workers available"]})
+                return
             
             self.log_callback(f"🚀 Starting execution: {self.task_name}")
-            self.log_callback(f"📡 Target workers ({len(self.nodes)}): {', '.join(self.nodes)}")
+            self.log_callback(f"📡 Target workers ({len(execution_nodes)}): {', '.join(execution_nodes)}")
             self.log_callback(f"📦 Payload summary: {summarize_payload(self.payload)}")
             attachment_count = count_attachment_files(self.payload)
             if attachment_count:
                 self.log_callback(f"📁 Attaching {attachment_count} file(s) to payload")
             
-            for idx, node in enumerate(self.nodes):
+            for idx, node in enumerate(execution_nodes):
                 if not self.is_running:
                     break
                 
@@ -343,7 +708,7 @@ class TaskExecutionWorker(threading.Thread):
                     )
                 
                 # Update progress
-                progress = (idx + 1) / len(self.nodes)
+                progress = (idx + 1) / len(execution_nodes)
                 self.progress_callback(progress)
             
             # Aggregate results
@@ -398,61 +763,130 @@ class ChunkedTaskExecutionWorker(threading.Thread):
             results = []
             errors = []
             run_started = time.perf_counter()
+            total_chunks = len(self.tasks)
+            failure_counts: Dict[str, int] = {}
+            task_attempts: Dict[str, int] = {}
+            completed_chunks = 0
+            max_attempts = max(3, len(self.nodes) * 3)
+
+            pending_tasks: List[Dict[str, Any]] = []
+            for idx, task in enumerate(self.tasks):
+                task_copy = dict(task)
+                task_copy["task_id"] = task_copy.get("task_id", f"{self.task_name}-chunk-{idx + 1}")
+                pending_tasks.append(task_copy)
+                task_attempts[task_copy["task_id"]] = 0
             
             self.log_callback(f"🚀 Starting chunked execution: {self.task_name}")
             self.log_callback(f"🧩 Chunks: {len(self.tasks)} across {len(self.nodes)} node(s)")
             attachment_count = count_attachment_files(self.tasks[0].get("payload", {})) if self.tasks else 0
             if attachment_count:
                 self.log_callback(f"📁 Attaching {attachment_count} file(s) per chunk")
-            
-            # Distribute chunks to nodes in round-robin fashion
-            for idx, task in enumerate(self.tasks):
-                if not self.is_running:
-                    break
-                
-                # Select node for this chunk (round-robin)
-                node = self.nodes[idx % len(self.nodes)]
-                
-                try:
-                    host, port = node.split(":")
-                    port = int(port)
-                except:
-                    errors.append(f"Invalid node address: {node}")
-                    continue
-                
-                task_name = task.get("task_name")
-                payload = task.get("payload")
-                task_id = task.get("task_id", f"{task_name}-chunk-{idx + 1}")
-                
-                self.log_callback(
-                    f"➡ Sending chunk {idx + 1}/{len(self.tasks)} | task_id={task_id} to {node} | payload={summarize_payload(payload)}"
-                )
-                
-                task_data = {
-                    "task_id": task_id,
-                    "task_name": task_name,
-                    "payload": payload
-                }
 
-                node_started = time.perf_counter()
-                
-                result = MasterClient.send_task(host, port, task_data)
-                duration_ms = (time.perf_counter() - node_started) * 1000
-                
-                if result.get("status") == "error":
-                    errors.append(f"{node}: {result.get('message', 'Unknown error')}")
+            live_nodes, dead_nodes = _split_live_and_dead_nodes(self.nodes, timeout=0.8)
+            if dead_nodes:
+                self.log_callback(f"⚠ Offline before run: {', '.join(dead_nodes)}")
+
+            if not live_nodes:
+                self.log_callback("✗ No live worker nodes available")
+                self.completion_callback(False, {"errors": ["No live workers available"]})
+                return
+
+            while pending_tasks and self.is_running:
+                # Continuously refresh live workers to catch runtime drop-offs.
+                live_nodes, newly_dead = _split_live_and_dead_nodes(live_nodes, timeout=0.8)
+                if newly_dead:
+                    self.log_callback(f"⚠ Workers went offline: {', '.join(newly_dead)}")
+
+                if not live_nodes:
+                    errors.append(f"All workers went offline with {len(pending_tasks)} chunk(s) remaining")
+                    break
+
+                scheduled_chunks = _assign_tasks_with_module2(
+                    pending_tasks,
+                    live_nodes,
+                    self.log_callback,
+                    failure_counts=failure_counts,
+                )
+                if not scheduled_chunks:
+                    errors.append("No schedulable chunks produced for remaining tasks")
+                    break
+
+                # Wave execution: at most one chunk per live worker, then rebalance again.
+                wave: List[Tuple[Dict[str, Any], str]] = []
+                used_nodes = set()
+                for task, node in scheduled_chunks:
+                    if node in used_nodes:
+                        continue
+                    wave.append((task, node))
+                    used_nodes.add(node)
+                    if len(wave) >= len(live_nodes):
+                        break
+
+                if not wave:
+                    # Defensive fallback.
+                    wave = [(pending_tasks[0], live_nodes[0])]
+
+                for task, node in wave:
+                    if not self.is_running:
+                        break
+
+                    try:
+                        host, port = node.split(":")
+                        port = int(port)
+                    except Exception:
+                        errors.append(f"Invalid node address: {node}")
+                        # Remove impossible node from live set.
+                        live_nodes = [n for n in live_nodes if n != node]
+                        continue
+
+                    task_name = task.get("task_name")
+                    payload = task.get("payload")
+                    task_id = task.get("task_id", f"{task_name}-chunk")
+
+                    pending_label_index = (total_chunks - len(pending_tasks)) + 1
                     self.log_callback(
-                        f"❌ Chunk {idx + 1} | task_id={task_id} | {duration_ms:.2f} ms | {result.get('message')}"
+                        f"➡ Sending chunk {pending_label_index}/{total_chunks} | task_id={task_id} to {node} | payload={summarize_payload(payload)}"
                     )
-                else:
-                    results.append(result)
-                    self.log_callback(
-                        f"✅ Chunk {idx + 1} | task_id={task_id} | {duration_ms:.2f} ms | {summarize_result(result)}"
-                    )
-                
-                # Update progress
-                progress = (idx + 1) / len(self.tasks)
-                self.progress_callback(progress)
+
+                    task_data = {
+                        "task_id": task_id,
+                        "task_name": task_name,
+                        "payload": payload
+                    }
+
+                    node_started = time.perf_counter()
+                    result = MasterClient.send_task(host, port, task_data)
+                    duration_ms = (time.perf_counter() - node_started) * 1000
+
+                    if result.get("status") == "error":
+                        task_attempts[task_id] = task_attempts.get(task_id, 0) + 1
+                        failure_counts[node] = failure_counts.get(node, 0) + 1
+
+                        self.log_callback(
+                            f"❌ task_id={task_id} on {node} | {duration_ms:.2f} ms | attempt={task_attempts[task_id]} | {result.get('message')}"
+                        )
+
+                        # Track runtime offline transitions and remove dead node quickly.
+                        if not _is_node_live(node, timeout=0.6):
+                            self.log_callback(f"🔌 Worker marked offline during run: {node}")
+                            live_nodes = [n for n in live_nodes if n != node]
+
+                        if task_attempts[task_id] >= max_attempts:
+                            errors.append(
+                                f"{task_id} failed after {task_attempts[task_id]} attempts: {result.get('message', 'Unknown error')}"
+                            )
+                            pending_tasks = [t for t in pending_tasks if t.get("task_id") != task_id]
+                            completed_chunks += 1
+                    else:
+                        results.append(result)
+                        self.log_callback(
+                            f"✅ task_id={task_id} on {node} | {duration_ms:.2f} ms | {summarize_result(result)}"
+                        )
+                        pending_tasks = [t for t in pending_tasks if t.get("task_id") != task_id]
+                        completed_chunks += 1
+
+                    progress = (completed_chunks / total_chunks) if total_chunks else 1.0
+                    self.progress_callback(progress)
             
             # Aggregate results
             self.log_callback(f"🧮 Aggregating chunk results: success={len(results)}, failed={len(errors)}")
@@ -1245,6 +1679,18 @@ class MasterGUI:
 
                     for port in port_candidates:
                         node_addr = f"{ip}:{port}"
+
+                        # Cache resource hints for weighted chunk assignment.
+                        node_hints = {
+                            "cpu_cores": node_data.get("cpu_cores"),
+                            "cpu_freq_mhz": node_data.get("cpu_freq_mhz"),
+                            "cpu_percent": node_data.get("cpu_percent"),
+                            "ram_total_gb": node_data.get("ram_total_gb"),
+                            "ram_available_gb": node_data.get("ram_available_gb"),
+                        }
+                        NODE_RESOURCE_HINTS[node_addr] = node_hints
+                        NODE_RESOURCE_HINTS[ip] = node_hints
+
                         if node_addr not in self.nodes_listbox.get(0, tk.END):
                             self.nodes_listbox.insert(tk.END, node_addr)
                             self.discovered_nodes[node_addr] = True
