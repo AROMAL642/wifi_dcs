@@ -42,8 +42,21 @@ class WorkerGUI:
         self.worker_server = None
         
         self.logs_text = None
+        self.max_log_chars = 2000
+        self.max_log_lines = 1200
         
         self._create_widgets()
+
+    def _run_on_ui_thread(self, fn: Callable, *args, **kwargs):
+        """Execute UI updates on Tk main thread safely."""
+        try:
+            if threading.current_thread() is threading.main_thread():
+                fn(*args, **kwargs)
+            else:
+                self.root.after(0, lambda: fn(*args, **kwargs))
+        except Exception:
+            # UI may already be closing; ignore late updates.
+            pass
     
     def _get_worker_name(self) -> str:
         """Get unique worker name."""
@@ -249,8 +262,8 @@ class WorkerGUI:
             self._log(f"✅ Completed: {task_id}")
             self._log(f"   Duration: {duration_ms:.2f} ms")
             self._log(f"   Result: {self._summarize_result(result)}")
-            self._add_task_to_queue(f"✓ {task_id} ({task_name})")
-            self._update_task_count()
+            self._run_on_ui_thread(self._add_task_to_queue, f"✓ {task_id} ({task_name})")
+            self._run_on_ui_thread(self._update_task_count)
             
             return result
         
@@ -259,8 +272,8 @@ class WorkerGUI:
             error_msg = str(e)
             self._log(f"❌ Failed: {task_id} ({task_name})")
             self._log(f"   Error: {error_msg}")
-            self._add_task_to_queue(f"✗ {task_id} ({task_name}) - {error_msg}")
-            self._update_task_count()
+            self._run_on_ui_thread(self._add_task_to_queue, f"✗ {task_id} ({task_name}) - {error_msg}")
+            self._run_on_ui_thread(self._update_task_count)
             return {"status": "error", "message": error_msg}
 
     def _summarize_payload(self, payload: Dict) -> str:
@@ -276,9 +289,15 @@ class WorkerGUI:
                     }
                 else:
                     compact[key] = value
-            return json.dumps(compact, ensure_ascii=False)
+            summary = json.dumps(compact, ensure_ascii=False)
+            if len(summary) > self.max_log_chars:
+                return summary[: self.max_log_chars] + "... [truncated]"
+            return summary
         except Exception:
-            return str(payload)
+            text = str(payload)
+            if len(text) > self.max_log_chars:
+                return text[: self.max_log_chars] + "... [truncated]"
+            return text
 
     def _summarize_result(self, result: Dict) -> str:
         """Create compact result summary for logs."""
@@ -330,11 +349,8 @@ System:
   CPU: {cpu_percent:.1f}%
   Memory: {memory.percent:.1f}%
   Disk: {psutil.disk_usage('/').percent:.1f}%"""
-                    
-                    self.status_text.config(state="normal")
-                    self.status_text.delete("1.0", tk.END)
-                    self.status_text.insert("1.0", info)
-                    self.status_text.config(state="disabled")
+
+                    self._run_on_ui_thread(self._set_status_text, info)
                     
                     threading.Event().wait(5)
                 except:
@@ -342,13 +358,30 @@ System:
         
         thread = threading.Thread(target=update, daemon=True)
         thread.start()
+
+    def _set_status_text(self, info: str):
+        """Safely set worker status textbox content."""
+        try:
+            self.status_text.config(state="normal")
+            self.status_text.delete("1.0", tk.END)
+            self.status_text.insert("1.0", info)
+            self.status_text.config(state="disabled")
+        except Exception:
+            pass
     
     def _on_node_discovered(self, node_addr: str, state: str):
         """Handle master node discovery."""
         if state == "discovered":
             self._log(f"Master discovered: {node_addr}")
+            self._run_on_ui_thread(self._add_discovered_master, node_addr)
+
+    def _add_discovered_master(self, node_addr: str):
+        """Safely append discovered master to listbox."""
+        try:
             if node_addr not in self.masters_listbox.get(0, tk.END):
                 self.masters_listbox.insert(tk.END, node_addr)
+        except Exception:
+            pass
     
     def _refresh_masters(self):
         """Refresh master node list."""
@@ -361,11 +394,27 @@ System:
         """Add message to logs."""
         if self.logs_text is None:
             return
-        
+
+        text = str(message)
+        if len(text) > self.max_log_chars:
+            text = text[: self.max_log_chars] + "... [truncated]"
+
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_msg = f"[{timestamp}] {message}\n"
-        self.logs_text.insert(tk.END, log_msg)
-        self.logs_text.see(tk.END)
+        log_msg = f"[{timestamp}] {text}\n"
+        self._run_on_ui_thread(self._append_log_line, log_msg)
+
+    def _append_log_line(self, log_msg: str):
+        """Safely append one log line and trim old lines."""
+        try:
+            self.logs_text.insert(tk.END, log_msg)
+            # Trim old lines to keep render size bounded.
+            line_count = int(self.logs_text.index("end-1c").split(".")[0])
+            if line_count > self.max_log_lines:
+                remove_until = line_count - self.max_log_lines
+                self.logs_text.delete("1.0", f"{remove_until}.0")
+            self.logs_text.see(tk.END)
+        except Exception:
+            pass
     
     def cleanup(self):
         """Cleanup on exit."""
