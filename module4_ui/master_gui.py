@@ -12,6 +12,7 @@ import socket
 import inspect
 import time
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import builtins
 from pathlib import Path
 from datetime import datetime
@@ -640,7 +641,8 @@ class TaskExecutionWorker(threading.Thread):
     """Background worker for distributed task execution."""
     
     def __init__(self, task_name: str, payload: Dict, nodes: List[str], 
-                 progress_callback: Callable, completion_callback: Callable, log_callback: Callable):
+                 progress_callback: Callable, completion_callback: Callable, log_callback: Callable,
+                 metrics_callback: Optional[Callable] = None):
         super().__init__(daemon=True)
         self.task_name = task_name
         self.payload = payload
@@ -648,7 +650,88 @@ class TaskExecutionWorker(threading.Thread):
         self.progress_callback = progress_callback
         self.completion_callback = completion_callback
         self.log_callback = log_callback
+        self.metrics_callback = metrics_callback
         self.is_running = False
+
+    def _emit_metrics_snapshot(self, worker_stats: Dict[str, Dict[str, Any]], completed: int, total: int, started_at: float):
+        """Send live performance snapshot to GUI."""
+        if not self.metrics_callback:
+            return
+
+        elapsed_s = max(0.001, time.perf_counter() - started_at)
+        cluster_throughput = completed / elapsed_s
+        remaining = max(0, total - completed)
+        eta_cluster = (remaining / cluster_throughput) if cluster_throughput > 0 else None
+
+        workers_payload: Dict[str, Dict[str, Any]] = {}
+        for node, st in worker_stats.items():
+            attempts = int(st.get("attempts", 0))
+            successes = int(st.get("successes", 0))
+            failures = int(st.get("failures", 0))
+            retries = int(st.get("retries", 0))
+            total_duration_ms = float(st.get("total_duration_ms", 0.0))
+            throughput = successes / max(0.001, total_duration_ms / 1000.0)
+            avg_latency = total_duration_ms / attempts if attempts > 0 else 0.0
+            success_rate = (successes / attempts) * 100.0 if attempts > 0 else 0.0
+            eta_worker = (remaining / throughput) if throughput > 0 else None
+
+            workers_payload[node] = {
+                "attempts": attempts,
+                "successes": successes,
+                "failures": failures,
+                "retries": retries,
+                "throughput": throughput,
+                "avg_latency_ms": avg_latency,
+                "success_rate": success_rate,
+                "eta_s": eta_worker,
+                "last_status": st.get("last_status", "idle"),
+            }
+
+        self.metrics_callback({
+            "mode": "task",
+            "task_name": self.task_name,
+            "completed": completed,
+            "total": total,
+            "cluster_throughput": cluster_throughput,
+            "cluster_eta_s": eta_cluster,
+            "elapsed_s": elapsed_s,
+            "workers": workers_payload,
+        })
+
+    def _execute_on_node(self, node: str, task_id: str) -> Dict[str, Any]:
+        """Execute non-chunked task on one node and return execution metadata."""
+        try:
+            host, port = node.split(":")
+            port = int(port)
+        except Exception:
+            return {
+                "node": node,
+                "task_id": task_id,
+                "status": "error",
+                "message": f"Invalid node address: {node}",
+                "duration_ms": 0.0,
+                "result": {"status": "error", "message": f"Invalid node address: {node}"},
+            }
+
+        task_data = {
+            "task_id": task_id,
+            "task_name": self.task_name,
+            "payload": self.payload
+        }
+
+        started = time.perf_counter()
+        result = MasterClient.send_task(host, port, task_data)
+        duration_ms = (time.perf_counter() - started) * 1000
+        status = "ok" if result.get("status") != "error" else "error"
+
+        return {
+            "node": node,
+            "task_id": task_id,
+            "status": status,
+            "message": result.get("message", "") if status == "error" else "",
+            "duration_ms": duration_ms,
+            "result": result,
+        }
     
     def run(self):
         """Execute task on all nodes and aggregate results."""
@@ -671,45 +754,72 @@ class TaskExecutionWorker(threading.Thread):
             attachment_count = count_attachment_files(self.payload)
             if attachment_count:
                 self.log_callback(f"📁 Attaching {attachment_count} file(s) to payload")
-            
-            for idx, node in enumerate(execution_nodes):
-                if not self.is_running:
-                    break
-                
-                try:
-                    host, port = node.split(":")
-                    port = int(port)
-                except:
-                    errors.append(f"Invalid node address: {node}")
-                    continue
 
+            dispatch_targets: List[Tuple[str, str]] = []
+            for idx, node in enumerate(execution_nodes):
                 task_id = f"{self.task_name}-{idx + 1}-{int(time.time() * 1000)}"
-                
-                self.log_callback(f"➡ Sending task_id={task_id} to {node}")
-                
-                task_data = {
-                    "task_id": task_id,
-                    "task_name": self.task_name,
-                    "payload": self.payload
+                dispatch_targets.append((node, task_id))
+                self.log_callback(f"➡ Queue task_id={task_id} to {node}")
+
+            worker_stats: Dict[str, Dict[str, Any]] = {
+                node: {
+                    "attempts": 0,
+                    "successes": 0,
+                    "failures": 0,
+                    "retries": 0,
+                    "total_duration_ms": 0.0,
+                    "last_status": "queued",
+                }
+                for node, _ in dispatch_targets
+            }
+
+            completed = 0
+            total_units = len(dispatch_targets)
+            self._emit_metrics_snapshot(worker_stats, completed, total_units, run_started)
+            with ThreadPoolExecutor(max_workers=max(1, len(dispatch_targets))) as pool:
+                future_map = {
+                    pool.submit(self._execute_on_node, node, task_id): (node, task_id)
+                    for node, task_id in dispatch_targets
                 }
 
-                node_started = time.perf_counter()
-                
-                result = MasterClient.send_task(host, port, task_data)
-                duration_ms = (time.perf_counter() - node_started) * 1000
-                
-                if result.get("status") == "error":
-                    errors.append(f"{node}: {result.get('message', 'Unknown error')}")
-                    self.log_callback(f"❌ {node} | task_id={task_id} | {duration_ms:.2f} ms | {result.get('message')}")
-                else:
-                    results.append(result)
-                    self.log_callback(
-                        f"✅ {node} | task_id={task_id} | {duration_ms:.2f} ms | {summarize_result(result)}"
-                    )
-                
-                # Update progress
-                progress = (idx + 1) / len(execution_nodes)
-                self.progress_callback(progress)
+                for future in as_completed(future_map):
+                    if not self.is_running:
+                        break
+
+                    outcome = future.result()
+                    node = outcome["node"]
+                    task_id = outcome["task_id"]
+                    duration_ms = outcome["duration_ms"]
+                    node_stat = worker_stats.setdefault(node, {
+                        "attempts": 0,
+                        "successes": 0,
+                        "failures": 0,
+                        "retries": 0,
+                        "total_duration_ms": 0.0,
+                        "last_status": "queued",
+                    })
+                    node_stat["attempts"] += 1
+                    node_stat["total_duration_ms"] += duration_ms
+
+                    if outcome["status"] == "error":
+                        node_stat["failures"] += 1
+                        node_stat["retries"] += 1
+                        node_stat["last_status"] = "error"
+                        errors.append(f"{node}: {outcome.get('message', 'Unknown error')}")
+                        self.log_callback(f"❌ {node} | task_id={task_id} | {duration_ms:.2f} ms | {outcome.get('message')}")
+                    else:
+                        result = outcome["result"]
+                        node_stat["successes"] += 1
+                        node_stat["last_status"] = "success"
+                        results.append(result)
+                        self.log_callback(
+                            f"✅ {node} | task_id={task_id} | {duration_ms:.2f} ms | {summarize_result(result)}"
+                        )
+
+                    completed += 1
+                    progress = completed / total_units
+                    self.progress_callback(progress)
+                    self._emit_metrics_snapshot(worker_stats, completed, total_units, run_started)
             
             # Aggregate results
             self.log_callback(f"🧮 Aggregating results: success={len(results)}, failed={len(errors)}")
@@ -746,7 +856,8 @@ class ChunkedTaskExecutionWorker(threading.Thread):
     """Background worker for distributed task execution with chunking."""
     
     def __init__(self, task_name: str, tasks: List[Dict], nodes: List[str], 
-                 progress_callback: Callable, completion_callback: Callable, log_callback: Callable):
+                 progress_callback: Callable, completion_callback: Callable, log_callback: Callable,
+                 metrics_callback: Optional[Callable] = None):
         super().__init__(daemon=True)
         self.task_name = task_name
         self.tasks = tasks  # List of chunked tasks
@@ -754,7 +865,93 @@ class ChunkedTaskExecutionWorker(threading.Thread):
         self.progress_callback = progress_callback
         self.completion_callback = completion_callback
         self.log_callback = log_callback
+        self.metrics_callback = metrics_callback
         self.is_running = False
+
+    def _emit_metrics_snapshot(self, worker_stats: Dict[str, Dict[str, Any]], completed: int, total: int, started_at: float):
+        """Send live performance snapshot to GUI for chunked execution."""
+        if not self.metrics_callback:
+            return
+
+        elapsed_s = max(0.001, time.perf_counter() - started_at)
+        cluster_throughput = completed / elapsed_s
+        remaining = max(0, total - completed)
+        eta_cluster = (remaining / cluster_throughput) if cluster_throughput > 0 else None
+
+        workers_payload: Dict[str, Dict[str, Any]] = {}
+        for node, st in worker_stats.items():
+            attempts = int(st.get("attempts", 0))
+            successes = int(st.get("successes", 0))
+            failures = int(st.get("failures", 0))
+            retries = int(st.get("retries", 0))
+            total_duration_ms = float(st.get("total_duration_ms", 0.0))
+            throughput = successes / max(0.001, total_duration_ms / 1000.0)
+            avg_latency = total_duration_ms / attempts if attempts > 0 else 0.0
+            success_rate = (successes / attempts) * 100.0 if attempts > 0 else 0.0
+            eta_worker = (remaining / throughput) if throughput > 0 else None
+
+            workers_payload[node] = {
+                "attempts": attempts,
+                "successes": successes,
+                "failures": failures,
+                "retries": retries,
+                "throughput": throughput,
+                "avg_latency_ms": avg_latency,
+                "success_rate": success_rate,
+                "eta_s": eta_worker,
+                "last_status": st.get("last_status", "idle"),
+            }
+
+        self.metrics_callback({
+            "mode": "chunked",
+            "task_name": self.task_name,
+            "completed": completed,
+            "total": total,
+            "cluster_throughput": cluster_throughput,
+            "cluster_eta_s": eta_cluster,
+            "elapsed_s": elapsed_s,
+            "workers": workers_payload,
+        })
+
+    def _execute_chunk_on_node(self, task: Dict[str, Any], node: str) -> Dict[str, Any]:
+        """Execute one chunk on one node and return metadata for master-side coordination."""
+        task_name = task.get("task_name")
+        payload = task.get("payload")
+        task_id = task.get("task_id", f"{task_name}-chunk")
+
+        try:
+            host, port = node.split(":")
+            port = int(port)
+        except Exception:
+            return {
+                "task_id": task_id,
+                "task": task,
+                "node": node,
+                "status": "error",
+                "duration_ms": 0.0,
+                "message": f"Invalid node address: {node}",
+                "result": {"status": "error", "message": f"Invalid node address: {node}"},
+            }
+
+        task_data = {
+            "task_id": task_id,
+            "task_name": task_name,
+            "payload": payload
+        }
+
+        started = time.perf_counter()
+        result = MasterClient.send_task(host, port, task_data)
+        duration_ms = (time.perf_counter() - started) * 1000
+
+        return {
+            "task_id": task_id,
+            "task": task,
+            "node": node,
+            "status": "ok" if result.get("status") != "error" else "error",
+            "duration_ms": duration_ms,
+            "message": result.get("message", "") if result.get("status") == "error" else "",
+            "result": result,
+        }
     
     def run(self):
         """Execute chunked tasks on nodes and aggregate results."""
@@ -768,6 +965,18 @@ class ChunkedTaskExecutionWorker(threading.Thread):
             task_attempts: Dict[str, int] = {}
             completed_chunks = 0
             max_attempts = max(3, len(self.nodes) * 3)
+            chunk_state: Dict[str, str] = {}
+            worker_stats: Dict[str, Dict[str, Any]] = {
+                node: {
+                    "attempts": 0,
+                    "successes": 0,
+                    "failures": 0,
+                    "retries": 0,
+                    "total_duration_ms": 0.0,
+                    "last_status": "idle",
+                }
+                for node in self.nodes
+            }
 
             pending_tasks: List[Dict[str, Any]] = []
             for idx, task in enumerate(self.tasks):
@@ -775,6 +984,7 @@ class ChunkedTaskExecutionWorker(threading.Thread):
                 task_copy["task_id"] = task_copy.get("task_id", f"{self.task_name}-chunk-{idx + 1}")
                 pending_tasks.append(task_copy)
                 task_attempts[task_copy["task_id"]] = 0
+                chunk_state[task_copy["task_id"]] = "pending"
             
             self.log_callback(f"🚀 Starting chunked execution: {self.task_name}")
             self.log_callback(f"🧩 Chunks: {len(self.tasks)} across {len(self.nodes)} node(s)")
@@ -790,6 +1000,8 @@ class ChunkedTaskExecutionWorker(threading.Thread):
                 self.log_callback("✗ No live worker nodes available")
                 self.completion_callback(False, {"errors": ["No live workers available"]})
                 return
+
+            self._emit_metrics_snapshot(worker_stats, completed_chunks, total_chunks, run_started)
 
             while pending_tasks and self.is_running:
                 # Continuously refresh live workers to catch runtime drop-offs.
@@ -827,66 +1039,88 @@ class ChunkedTaskExecutionWorker(threading.Thread):
                     wave = [(pending_tasks[0], live_nodes[0])]
 
                 for task, node in wave:
-                    if not self.is_running:
-                        break
-
-                    try:
-                        host, port = node.split(":")
-                        port = int(port)
-                    except Exception:
-                        errors.append(f"Invalid node address: {node}")
-                        # Remove impossible node from live set.
-                        live_nodes = [n for n in live_nodes if n != node]
-                        continue
-
-                    task_name = task.get("task_name")
-                    payload = task.get("payload")
-                    task_id = task.get("task_id", f"{task_name}-chunk")
-
+                    task_id = task.get("task_id", f"{self.task_name}-chunk")
+                    chunk_state[task_id] = "running"
                     pending_label_index = (total_chunks - len(pending_tasks)) + 1
                     self.log_callback(
-                        f"➡ Sending chunk {pending_label_index}/{total_chunks} | task_id={task_id} to {node} | payload={summarize_payload(payload)}"
+                        f"➡ Queue chunk {pending_label_index}/{total_chunks} | task_id={task_id} to {node} | payload={summarize_payload(task.get('payload'))}"
                     )
 
-                    task_data = {
-                        "task_id": task_id,
-                        "task_name": task_name,
-                        "payload": payload
+                with ThreadPoolExecutor(max_workers=max(1, len(wave))) as pool:
+                    future_map = {
+                        pool.submit(self._execute_chunk_on_node, task, node): (task, node)
+                        for task, node in wave
                     }
 
-                    node_started = time.perf_counter()
-                    result = MasterClient.send_task(host, port, task_data)
-                    duration_ms = (time.perf_counter() - node_started) * 1000
+                    for future in as_completed(future_map):
+                        if not self.is_running:
+                            break
 
-                    if result.get("status") == "error":
-                        task_attempts[task_id] = task_attempts.get(task_id, 0) + 1
-                        failure_counts[node] = failure_counts.get(node, 0) + 1
+                        outcome = future.result()
+                        task = outcome["task"]
+                        task_id = outcome["task_id"]
+                        node = outcome["node"]
+                        duration_ms = outcome["duration_ms"]
+                        node_stat = worker_stats.setdefault(node, {
+                            "attempts": 0,
+                            "successes": 0,
+                            "failures": 0,
+                            "retries": 0,
+                            "total_duration_ms": 0.0,
+                            "last_status": "idle",
+                        })
+                        node_stat["attempts"] += 1
+                        node_stat["total_duration_ms"] += duration_ms
 
-                        self.log_callback(
-                            f"❌ task_id={task_id} on {node} | {duration_ms:.2f} ms | attempt={task_attempts[task_id]} | {result.get('message')}"
-                        )
+                        if outcome["status"] == "error":
+                            task_attempts[task_id] = task_attempts.get(task_id, 0) + 1
+                            failure_counts[node] = failure_counts.get(node, 0) + 1
+                            chunk_state[task_id] = "pending"
+                            node_stat["failures"] += 1
+                            node_stat["retries"] += 1
+                            node_stat["last_status"] = "error"
 
-                        # Track runtime offline transitions and remove dead node quickly.
-                        if not _is_node_live(node, timeout=0.6):
-                            self.log_callback(f"🔌 Worker marked offline during run: {node}")
-                            live_nodes = [n for n in live_nodes if n != node]
+                            self.log_callback(
+                                f"❌ task_id={task_id} on {node} | {duration_ms:.2f} ms | attempt={task_attempts[task_id]} | {outcome.get('message')}"
+                            )
 
-                        if task_attempts[task_id] >= max_attempts:
-                            errors.append(
-                                f"{task_id} failed after {task_attempts[task_id]} attempts: {result.get('message', 'Unknown error')}"
+                            if not _is_node_live(node, timeout=0.6):
+                                self.log_callback(f"🔌 Worker marked offline during run: {node}")
+                                live_nodes = [n for n in live_nodes if n != node]
+
+                            if task_attempts[task_id] >= max_attempts:
+                                errors.append(
+                                    f"{task_id} failed after {task_attempts[task_id]} attempts: {outcome.get('message', 'Unknown error')}"
+                                )
+                                chunk_state[task_id] = "failed"
+                                pending_tasks = [t for t in pending_tasks if t.get("task_id") != task_id]
+                                completed_chunks += 1
+                        else:
+                            result = outcome["result"]
+                            results.append(result)
+                            chunk_state[task_id] = "success"
+                            node_stat["successes"] += 1
+                            node_stat["last_status"] = "success"
+                            self.log_callback(
+                                f"✅ task_id={task_id} on {node} | {duration_ms:.2f} ms | {summarize_result(result)}"
                             )
                             pending_tasks = [t for t in pending_tasks if t.get("task_id") != task_id]
                             completed_chunks += 1
-                    else:
-                        results.append(result)
-                        self.log_callback(
-                            f"✅ task_id={task_id} on {node} | {duration_ms:.2f} ms | {summarize_result(result)}"
-                        )
-                        pending_tasks = [t for t in pending_tasks if t.get("task_id") != task_id]
-                        completed_chunks += 1
 
-                    progress = (completed_chunks / total_chunks) if total_chunks else 1.0
-                    self.progress_callback(progress)
+                        progress = (completed_chunks / total_chunks) if total_chunks else 1.0
+                        self.progress_callback(progress)
+                        self._emit_metrics_snapshot(worker_stats, completed_chunks, total_chunks, run_started)
+
+                # State snapshot for master-side coordination visibility.
+                state_counts: Dict[str, int] = {"pending": 0, "running": 0, "success": 0, "failed": 0}
+                for state in chunk_state.values():
+                    if state in state_counts:
+                        state_counts[state] += 1
+                self.log_callback(
+                    "📈 Chunk states | "
+                    f"pending={state_counts['pending']} running={state_counts['running']} "
+                    f"success={state_counts['success']} failed={state_counts['failed']}"
+                )
             
             # Aggregate results
             self.log_callback(f"🧮 Aggregating chunk results: success={len(results)}, failed={len(errors)}")
@@ -1388,6 +1622,10 @@ class MasterGUI:
         self.param_entries = {}
         self.auto_configure_btn = None
         self._auto_configure_running = False
+        self.performance_tree = None
+        self.performance_summary_var = None
+        self.performance_task_var = None
+        self._performance_stats: Dict[str, Any] = {}
         
         self._create_widgets()
         self._start_discovery()
@@ -1587,6 +1825,40 @@ class MasterGUI:
         
         tk.Button(button_frame, text="Export Results", command=self._export_results,
                  bg="#FF9800", fg="white", width=20).pack(side="left", padx=5)
+
+        perf_frame = tk.LabelFrame(parent, text="Live Performance Panel", bg="white", font=("Arial", 10, "bold"))
+        perf_frame.pack(padx=10, pady=6, fill="x")
+
+        self.performance_task_var = tk.StringVar(value="Task: -")
+        tk.Label(perf_frame, textvariable=self.performance_task_var, bg="white", fg="#2c3e50", font=("Arial", 9, "bold")).pack(anchor="w", padx=8, pady=(6, 2))
+
+        self.performance_summary_var = tk.StringVar(value="Throughput: 0.00 chunk/s | ETA: - | Speedup est: -")
+        tk.Label(perf_frame, textvariable=self.performance_summary_var, bg="white", fg="#1b5e20", font=("Arial", 9)).pack(anchor="w", padx=8, pady=(0, 6))
+
+        columns = ("worker", "throughput", "retries", "success_rate", "eta", "completed", "failed", "avg_latency", "state")
+        self.performance_tree = ttk.Treeview(perf_frame, columns=columns, show="headings", height=6)
+        self.performance_tree.heading("worker", text="Worker")
+        self.performance_tree.heading("throughput", text="Throughput(ch/s)")
+        self.performance_tree.heading("retries", text="Retries")
+        self.performance_tree.heading("success_rate", text="Success %")
+        self.performance_tree.heading("eta", text="ETA(s)")
+        self.performance_tree.heading("completed", text="Completed")
+        self.performance_tree.heading("failed", text="Failed")
+        self.performance_tree.heading("avg_latency", text="Avg Lat(ms)")
+        self.performance_tree.heading("state", text="State")
+
+        self.performance_tree.column("worker", width=160, anchor="w")
+        self.performance_tree.column("throughput", width=120, anchor="center")
+        self.performance_tree.column("retries", width=70, anchor="center")
+        self.performance_tree.column("success_rate", width=90, anchor="center")
+        self.performance_tree.column("eta", width=80, anchor="center")
+        self.performance_tree.column("completed", width=85, anchor="center")
+        self.performance_tree.column("failed", width=70, anchor="center")
+        self.performance_tree.column("avg_latency", width=95, anchor="center")
+        self.performance_tree.column("state", width=80, anchor="center")
+        self.performance_tree.pack(fill="x", padx=8, pady=(0, 8))
+
+        self._reset_performance_panel()
         
         tk.Label(parent, text="Results:", font=("Arial", 10, "bold"), bg="white").pack(padx=10, pady=(10, 5), anchor="w")
         
@@ -1758,6 +2030,99 @@ class MasterGUI:
             self._log("Execution stopped by user")
             self.execute_btn.config(state="normal")
             self.stop_btn.config(state="disabled")
+
+    def _reset_performance_panel(self, task_name: str = "-"):
+        """Reset live performance panel state."""
+        self._performance_stats = {
+            "task_name": task_name,
+            "workers": {},
+            "cluster_throughput": 0.0,
+            "cluster_eta_s": None,
+            "completed": 0,
+            "total": 0,
+            "elapsed_s": 0.0,
+        }
+        if self.performance_task_var:
+            self.performance_task_var.set(f"Task: {task_name}")
+        if self.performance_summary_var:
+            self.performance_summary_var.set("Throughput: 0.00 chunk/s | ETA: - | Speedup est: -")
+        if self.performance_tree:
+            for iid in self.performance_tree.get_children():
+                self.performance_tree.delete(iid)
+
+    def _update_performance_metrics(self, event: Dict[str, Any]):
+        """Thread-safe entry point for live performance updates from workers."""
+        self.root.after(0, lambda: self._apply_performance_metrics(event))
+
+    def _apply_performance_metrics(self, event: Dict[str, Any]):
+        """Render latest performance snapshot into UI panel."""
+        if not isinstance(event, dict):
+            return
+
+        self._performance_stats.update({
+            "task_name": event.get("task_name", self._performance_stats.get("task_name", "-")),
+            "cluster_throughput": float(event.get("cluster_throughput", 0.0) or 0.0),
+            "cluster_eta_s": event.get("cluster_eta_s"),
+            "completed": int(event.get("completed", 0) or 0),
+            "total": int(event.get("total", 0) or 0),
+            "elapsed_s": float(event.get("elapsed_s", 0.0) or 0.0),
+        })
+
+        incoming_workers = event.get("workers", {}) or {}
+        self._performance_stats["workers"] = incoming_workers
+
+        if self.performance_task_var:
+            task_name = self._performance_stats.get("task_name", "-")
+            completed = self._performance_stats.get("completed", 0)
+            total = self._performance_stats.get("total", 0)
+            self.performance_task_var.set(f"Task: {task_name} | Progress: {completed}/{total}")
+
+        if self.performance_tree:
+            existing = {self.performance_tree.item(iid, "values")[0]: iid for iid in self.performance_tree.get_children() if self.performance_tree.item(iid, "values")}
+            for node, st in incoming_workers.items():
+                throughput = float(st.get("throughput", 0.0) or 0.0)
+                retries = int(st.get("retries", 0) or 0)
+                success_rate = float(st.get("success_rate", 0.0) or 0.0)
+                eta_s = st.get("eta_s")
+                eta_text = f"{eta_s:.1f}" if isinstance(eta_s, (int, float)) else "-"
+                completed_w = int(st.get("successes", 0) or 0)
+                failed_w = int(st.get("failures", 0) or 0)
+                avg_latency = float(st.get("avg_latency_ms", 0.0) or 0.0)
+                state = st.get("last_status", "idle")
+
+                values = (
+                    node,
+                    f"{throughput:.2f}",
+                    str(retries),
+                    f"{success_rate:.1f}",
+                    eta_text,
+                    str(completed_w),
+                    str(failed_w),
+                    f"{avg_latency:.1f}",
+                    state,
+                )
+
+                iid = existing.get(node)
+                if iid:
+                    self.performance_tree.item(iid, values=values)
+                else:
+                    self.performance_tree.insert("", "end", values=values)
+
+        cluster_throughput = self._performance_stats.get("cluster_throughput", 0.0) or 0.0
+        eta_cluster = self._performance_stats.get("cluster_eta_s")
+        eta_cluster_text = f"{eta_cluster:.1f}s" if isinstance(eta_cluster, (int, float)) else "-"
+
+        workers = self._performance_stats.get("workers", {}) or {}
+        max_worker_tp = 0.0
+        for st in workers.values():
+            max_worker_tp = max(max_worker_tp, float(st.get("throughput", 0.0) or 0.0))
+        speedup_est = (cluster_throughput / max_worker_tp) if max_worker_tp > 0 else None
+        speedup_text = f"{speedup_est:.2f}x" if isinstance(speedup_est, (int, float)) else "-"
+
+        if self.performance_summary_var:
+            self.performance_summary_var.set(
+                f"Throughput: {cluster_throughput:.2f} chunk/s | ETA: {eta_cluster_text} | Speedup est: {speedup_text}"
+            )
     
     def _update_progress(self, progress: float):
         """Update progress bar."""
@@ -2078,6 +2443,7 @@ class MasterGUI:
             self.stop_btn.config(state="normal")
             self.progress_var.set(0)
             self.results_text.delete("1.0", tk.END)
+            self._reset_performance_panel(self.current_task)
             
             self._log(f"Starting: {self.current_task}")
             
@@ -2095,7 +2461,8 @@ class MasterGUI:
                 # Execute chunked tasks
                 self.current_worker = ChunkedTaskExecutionWorker(
                     self.current_task, tasks, nodes,
-                    self._update_progress, self._execution_complete, self._log
+                    self._update_progress, self._execution_complete, self._log,
+                    metrics_callback=self._update_performance_metrics
                 )
                 self.current_worker.start()
             
@@ -2111,7 +2478,8 @@ class MasterGUI:
                 # Execute chunked tasks
                 self.current_worker = ChunkedTaskExecutionWorker(
                     self.current_task, tasks, nodes,
-                    self._update_progress, self._execution_complete, self._log
+                    self._update_progress, self._execution_complete, self._log,
+                    metrics_callback=self._update_performance_metrics
                 )
                 self.current_worker.start()
             
@@ -2137,7 +2505,8 @@ class MasterGUI:
 
                         self.current_worker = ChunkedTaskExecutionWorker(
                             self.current_task, tasks, nodes,
-                            self._update_progress, self._execution_complete, self._log
+                            self._update_progress, self._execution_complete, self._log,
+                            metrics_callback=self._update_performance_metrics
                         )
                         self.current_worker.start()
                         return
@@ -2148,7 +2517,8 @@ class MasterGUI:
 
                 self.current_worker = TaskExecutionWorker(
                     self.current_task, payload, nodes,
-                    self._update_progress, self._execution_complete, self._log
+                    self._update_progress, self._execution_complete, self._log,
+                    metrics_callback=self._update_performance_metrics
                 )
                 self.current_worker.start()
         

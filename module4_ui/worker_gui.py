@@ -42,8 +42,8 @@ class WorkerGUI:
         self.worker_server = None
         
         self.logs_text = None
-        self.max_log_chars = 2000
-        self.max_log_lines = 1200
+        self.max_log_chars = 600
+        self.max_log_lines = 400
         
         self._create_widgets()
 
@@ -172,7 +172,15 @@ class WorkerGUI:
         """Create logs tab."""
         tk.Label(parent, text="Worker Logs", font=("Arial", 12, "bold"), bg="white").pack(padx=10, pady=10)
         
-        self.logs_text = scrolledtext.ScrolledText(parent, height=20, width=100, bg="#1e1e1e", fg="#00ff00")
+        self.logs_text = scrolledtext.ScrolledText(
+            parent,
+            height=20,
+            width=100,
+            bg="#1e1e1e",
+            fg="#00ff00",
+            wrap="word",
+            font=("TkFixedFont", 10),
+        )
         self.logs_text.pack(padx=10, pady=10, fill="both", expand=True)
         
         tk.Button(parent, text="Clear Logs", command=lambda: self.logs_text.delete("1.0", tk.END),
@@ -193,14 +201,14 @@ class WorkerGUI:
             self.worker_server = WorkerServer(port=self.worker_port, task_callback=self._execute_task_simple)
         
         self.worker_server.start()
-        self._log(f"✓ Worker server started on {get_local_ip()}:{self.worker_port}")
+        self._log(f"[OK] Worker server started on {get_local_ip()}:{self.worker_port}")
         
         self.discovery_service.start_discovery()
-        self._log("✓ Discovery service started")
+        self._log("[OK] Discovery service started")
         
         self.advertise_service = AdvertiseService(self.worker_name, "worker", self.worker_port)
         self.advertise_service.start_advertising()
-        self._log(f"✓ Advertising as '{self.worker_name}' on port {self.worker_port}")
+        self._log(f"[OK] Advertising as '{self.worker_name}' on port {self.worker_port}")
         
         self.service_btn.config(text="Stop Service", bg="#f44336")
         self._update_status()
@@ -210,9 +218,9 @@ class WorkerGUI:
         if self.worker_server:
             self.worker_server.stop()
             self.worker_server = None
-            self._log("✗ Worker server stopped")
+            self._log("[STOP] Worker server stopped")
         self.discovery_service.stop_discovery()
-        self._log("✗ Discovery service stopped")
+        self._log("[STOP] Discovery service stopped")
         if self.advertise_service:
             self.advertise_service.stop_advertising()
             self.advertise_service = None
@@ -239,10 +247,10 @@ class WorkerGUI:
             start_time = time.perf_counter()
             last_progress = -1
             
-            self._log(f"📥 Task received: {task_id}")
+            self._log(f"[TASK] Received: {task_id}")
             self._log(f"   Task: {task_name}")
             self._log(f"   Payload: {self._summarize_payload(payload)}")
-            self._log(f"⚙️  Executing: {task_id}")
+            self._log(f"[RUN] Executing: {task_id}")
 
             def progress_cb(p: float):
                 nonlocal last_progress
@@ -251,18 +259,18 @@ class WorkerGUI:
                 if progress_percent >= last_progress + 10 or progress_percent >= 100:
                     bar_length = 20
                     filled = int(bar_length * progress_percent / 100)
-                    bar = "█" * filled + "░" * (bar_length - filled)
-                    self._log(f"🔄 {task_id}: [{bar}] {progress_percent:.0f}%")
+                    bar = "#" * filled + "-" * (bar_length - filled)
+                    self._log(f"[PROGRESS] {task_id}: [{bar}] {progress_percent:.0f}%")
                     last_progress = progress_percent
             
             result = execute_task(task_name, payload, progress_cb)
             duration_ms = (time.perf_counter() - start_time) * 1000
             
             self.completed_tasks += 1
-            self._log(f"✅ Completed: {task_id}")
+            self._log(f"[DONE] Completed: {task_id}")
             self._log(f"   Duration: {duration_ms:.2f} ms")
             self._log(f"   Result: {self._summarize_result(result)}")
-            self._run_on_ui_thread(self._add_task_to_queue, f"✓ {task_id} ({task_name})")
+            self._run_on_ui_thread(self._add_task_to_queue, f"OK {task_id} ({task_name})")
             self._run_on_ui_thread(self._update_task_count)
             
             return result
@@ -270,9 +278,9 @@ class WorkerGUI:
         except Exception as e:
             self.failed_tasks += 1
             error_msg = str(e)
-            self._log(f"❌ Failed: {task_id} ({task_name})")
+            self._log(f"[ERROR] Failed: {task_id} ({task_name})")
             self._log(f"   Error: {error_msg}")
-            self._run_on_ui_thread(self._add_task_to_queue, f"✗ {task_id} ({task_name}) - {error_msg}")
+            self._run_on_ui_thread(self._add_task_to_queue, f"ERR {task_id} ({task_name}) - {error_msg}")
             self._run_on_ui_thread(self._update_task_count)
             return {"status": "error", "message": error_msg}
 
@@ -338,7 +346,7 @@ class WorkerGUI:
                     
                     info = f"""Worker: {self.worker_name}
 Port: {self.worker_port}
-Status: Online ✓
+Status: Online
 
 Tasks:
   Total: {self.total_tasks}
@@ -395,13 +403,19 @@ System:
         if self.logs_text is None:
             return
 
-        text = str(message)
+        text = self._sanitize_text(message)
         if len(text) > self.max_log_chars:
             text = text[: self.max_log_chars] + "... [truncated]"
 
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_msg = f"[{timestamp}] {text}\n"
         self._run_on_ui_thread(self._append_log_line, log_msg)
+
+    def _sanitize_text(self, message: str) -> str:
+        """Reduce unsupported glyph rendering issues on some X11 stacks."""
+        text = str(message)
+        # Keep logs ASCII-safe to avoid problematic glyph rendering on older systems.
+        return text.encode("ascii", "replace").decode("ascii")
 
     def _append_log_line(self, log_msg: str):
         """Safely append one log line and trim old lines."""
