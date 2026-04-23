@@ -73,3 +73,8 @@ git clone https://github.com/AROMAL642/wifi_dcs.git
 cd wifi_dcs
 pip install -r module1_discovery/requirements.txt
 pip install -r module4_ui/requirements.txt
+
+
+
+
+hash values- 674f3c2c1a8a6f90461e8a66fb5550ba
